@@ -28,7 +28,7 @@ from enum import Enum
 import psutil
 
 # =============================================================================
-# 常数定义 (RTX 3090 最优)
+# Constants (RTX 3090 optimal)
 # =============================================================================
 CP_ASYNC_STAGES = 4
 WORK_CHUNK_SIZE = 128
@@ -382,7 +382,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 """
 
 # =============================================================================
-# Load CUDA Extension (RTX 3090优化)
+# Load CUDA Extension (RTX 3090 optimized)
 # =============================================================================
 def align16(x: int) -> int:
     return (x + 15) & ~15
@@ -424,14 +424,14 @@ class PrioritizedRequest:
     priority: int
     arrival_time: float
     req_id: str
-    input_ids: torch.Tensor
-    max_tokens: int
-    kv_signature: Tuple = field(default_factory=tuple)
-    kv_head: int = 0
-    ctx_len: int = 0
-    block_table: List[int] = field(default_factory=list)
-    sla_ms: float = 500.0
-    callback: Optional[Callable] = None
+    input_ids: torch.Tensor = field(compare=False)
+    max_tokens: int = field(compare=False)
+    kv_signature: Tuple = field(default_factory=tuple, compare=False)
+    kv_head: int = field(default=0, compare=False)
+    ctx_len: int = field(default=0, compare=False)
+    block_table: List[int] = field(default_factory=list, compare=False)
+    sla_ms: float = field(default=500.0, compare=False)
+    callback: Optional[Callable] = field(default=None, compare=False)
 
 # =============================================================================
 # Continuous Batch
@@ -606,7 +606,7 @@ class HyperionBatchingEngine:
         self.scheduler = KVAwareScheduler(max_batch_size=32)
         self.kernel_manager = PersistentKernelManager()
 
-        # KV缓存
+        # KV cache
         self.kv_cache = {
             'k': torch.zeros(num_blocks * block_size, num_kv_heads, self.packed_cols,
                              dtype=torch.int32, device='cuda'),
@@ -735,6 +735,149 @@ class SystemProfiler:
         }
 
 # =============================================================================
+# Configuration Dataclass
+# =============================================================================
+@dataclass
+class HyperionConfig:
+    """Centralised launch and model configuration for Hyperion FA3."""
+    # Kernel launch parameters
+    threads_per_block: int = THREADS_PER_BLOCK
+    cp_async_stages: int = CP_ASYNC_STAGES
+    work_chunk_size: int = WORK_CHUNK_SIZE
+    smem_pad: int = SMEM_PAD
+    vec_size: int = VEC_SIZE
+    max_head_dim: int = MAX_HEAD_DIM
+
+    # Model parameters
+    num_heads: int = 32
+    num_kv_heads: int = 8
+    head_dim: int = 128
+    block_size: int = 64
+    num_blocks: int = 1024
+
+    # Scheduler parameters
+    max_batch_size: int = 32
+    target_p95_ms: float = 100.0
+    target_p99_ms: float = 200.0
+    cluster_window_ms: float = 2.0
+
+    @property
+    def packed_cols(self) -> int:
+        return (self.head_dim + 31) // 32
+
+    @property
+    def inv_sqrt_d(self) -> float:
+        return 1.0 / math.sqrt(self.head_dim)
+
+
+# =============================================================================
+# Benchmark Utility
+# =============================================================================
+class HyperionBenchmark:
+    """Measures kernel and scheduler throughput/latency."""
+
+    def __init__(self, config: Optional[HyperionConfig] = None):
+        self.config = config or HyperionConfig()
+        self.profiler = SystemProfiler()
+
+    def run_memory_benchmark(self) -> Dict[str, Any]:
+        """Return memory estimates for several common model sizes."""
+        cfg = self.config
+        ModelSpec = Tuple[float, int, int, int, int, int]  # (size_b, num_layers, num_kv_heads, head_dim, ctx_len, batch_size)
+        models: Dict[str, ModelSpec] = {
+            "7B":   (7,    32, 32, 128, 4096, 1),
+            "13B":  (13,   40, 40, 128, 4096, 1),
+            "70B":  (70,   80,  8, 128, 4096, 1),
+            "405B": (405,  96, 16, 128, 2048, 1),
+        }
+        results: Dict[str, Any] = {}
+        for name, (size_b, num_layers, num_kv_heads, head_dim, ctx_len, batch_size) in models.items():
+            mem = self.profiler.calculate_memory_requirements(
+                size_b, ctx_len, batch_size, num_layers, cfg.num_heads, num_kv_heads, head_dim
+            )
+            results[name] = mem
+        return results
+
+    # Number of entries in the block-table used for each synthetic benchmark request
+    _BENCH_BLOCK_TABLE_SIZE = 32
+    # Sentinel sequence length for benchmark requests (tokens)
+    _BENCH_SEQ_LEN = 8
+    # Idle-poll interval (seconds) while waiting for the scheduler to drain
+    _SCHEDULER_POLL_INTERVAL_S = 0.001
+
+    def run_scheduler_benchmark(self, num_requests: int = 100,
+                                 max_tokens: int = 8) -> Dict[str, float]:
+        """Simulate scheduler throughput without a real model/GPU kernel."""
+        scheduler = KVAwareScheduler(
+            target_p95_ms=self.config.target_p95_ms,
+            target_p99_ms=self.config.target_p99_ms,
+            cluster_window_ms=self.config.cluster_window_ms,
+            max_batch_size=self.config.max_batch_size,
+        )
+
+        seq_len = self._BENCH_SEQ_LEN
+        t0 = time.perf_counter()
+        for i in range(num_requests):
+            block_table = [j % self.config.num_blocks for j in range(self._BENCH_BLOCK_TABLE_SIZE)]
+            req = PrioritizedRequest(
+                priority=i % 4,
+                arrival_time=time.time(),
+                req_id=f"bench_{i}",
+                input_ids=torch.zeros((1, seq_len), dtype=torch.long),
+                max_tokens=max_tokens,
+                kv_head=i % self.config.num_kv_heads,
+                ctx_len=seq_len,
+                block_table=block_table,
+            )
+            scheduler.submit(req)
+
+        batches_processed = 0
+        total_requests_completed = 0
+        while total_requests_completed < num_requests:
+            batch, _ = scheduler.get_next_batch()
+            if not batch:
+                time.sleep(self._SCHEDULER_POLL_INTERVAL_S)
+                continue
+            for req in batch:
+                scheduler.complete(req.req_id, tokens_generated=max_tokens)
+                total_requests_completed += 1
+            batches_processed += 1
+
+        elapsed = time.perf_counter() - t0
+        latencies = list(scheduler.latencies)
+        return {
+            "num_requests": num_requests,
+            "elapsed_s": elapsed,
+            "throughput_req_per_s": num_requests / elapsed,
+            "avg_latency_ms": float(np.mean(latencies)) if latencies else 0.0,
+            "p95_latency_ms": float(np.percentile(latencies, 95)) if latencies else 0.0,
+            "p99_latency_ms": float(np.percentile(latencies, 99)) if latencies else 0.0,
+            "batches_processed": batches_processed,
+        }
+
+    def print_report(self, num_requests: int = 100) -> None:
+        """Print a formatted benchmark report to stdout."""
+        print("\n" + "=" * 60)
+        print("📈 HYPERION FA3 BENCHMARK REPORT")
+        print("=" * 60)
+
+        print("\n  Memory Estimates:")
+        mem_results = self.run_memory_benchmark()
+        for name, mem in mem_results.items():
+            fits = "✅ fits" if mem["fits_on_3090"] else "❌ OOM"
+            print(f"    {name:>5}: {mem['total_gb']:6.1f} GB  {fits}")
+
+        print(f"\n  Scheduler Benchmark ({num_requests} requests):")
+        sched = self.run_scheduler_benchmark(num_requests=num_requests)
+        print(f"    Throughput : {sched['throughput_req_per_s']:.0f} req/s")
+        print(f"    Avg latency: {sched['avg_latency_ms']:.2f} ms")
+        print(f"    P95 latency: {sched['p95_latency_ms']:.2f} ms")
+        print(f"    P99 latency: {sched['p99_latency_ms']:.2f} ms")
+        print(f"    Batches    : {sched['batches_processed']}")
+        print("=" * 60)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 if __name__ == "__main__":
@@ -745,11 +888,11 @@ if __name__ == "__main__":
     profiler = SystemProfiler()
     info = profiler.get_system_info()
     
-    print("\n📊 系统信息:")
+    print("\n📊 System Info:")
     for k, v in info.items():
         print(f"  {k}: {v}")
 
-    print("\n🚀 硬化优化:")
+    print("\n🚀 Hardened Optimizations:")
     print("  ✅ Global counter reset kernel")
     print("  ✅ Correct WorkItem packing (int4)")
     print("  ✅ Safe block_tables indexing (fixed stride)")
@@ -762,23 +905,27 @@ if __name__ == "__main__":
     print("  ✅ 8-warp specialization (4 load + 4 compute)")
     print("  ✅ KV-aware scheduler with continuous batching")
 
-    print("\n💾 内存计算 (RTX 3090 24GB):")
+    print("\n💾 Memory Estimates (RTX 3090 24 GB):")
     mem_70b = profiler.calculate_memory_requirements(70, 4096, 1, 80, 64, 8, 128)
-    print(f"  70B模型: {mem_70b['total_gb']:.1f}GB ({mem_70b['fits_on_3090']})")
+    print(f"  70B model: {mem_70b['total_gb']:.1f} GB (fits={mem_70b['fits_on_3090']})")
     mem_405b = profiler.calculate_memory_requirements(405, 2048, 1, 96, 128, 16, 128)
-    print(f"  405B模型: {mem_405b['total_gb']:.1f}GB ({mem_405b['fits_on_3090']})")
+    print(f"  405B model: {mem_405b['total_gb']:.1f} GB (fits={mem_405b['fits_on_3090']})")
 
-    print("\n⚙️ 启动配置 (RTX 3090):")
+    print("\n⚙️ Launch Config (RTX 3090):")
     print(f"  Grid: ({min(info.get('sm_count', 82)*2,256)}, 1, 1)")
     print(f"  Block: ({THREADS_PER_BLOCK}, 1, 1)  # 8 warps")
-    print(f"  Shared Memory: {CP_ASYNC_STAGES}级流水线，动态计算")
+    print(f"  Shared Memory: {CP_ASYNC_STAGES}-stage pipeline, computed dynamically")
 
-    print("\n🏁 系统状态:")
-    print(f"  CUDA Kernel: {'✅ 已加载' if HYPERION_LOADED else '❌ 失败'}")
-    print(f"  GPU 可用: {'✅' if torch.cuda.is_available() else '❌'}")
+    print("\n🏁 System Status:")
+    print(f"  CUDA Kernel: {'✅ Loaded' if HYPERION_LOADED else '❌ Failed'}")
+    print(f"  GPU Available: {'✅' if torch.cuda.is_available() else '❌'}")
     print("=" * 80)
 
     if HYPERION_LOADED:
-        print("\n✅ 系统就绪，可开始处理请求。")
+        print("\n✅ System ready to serve requests.")
     else:
-        print("\n⚠️ 内核加载失败，请检查CUDA环境。")
+        print("\n⚠️  Kernel failed to load — check your CUDA environment.")
+
+    # Run benchmark report
+    benchmark = HyperionBenchmark()
+    benchmark.print_report()
