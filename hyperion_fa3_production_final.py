@@ -77,7 +77,7 @@ float fp8_e4m3_to_fp32(uint8_t x) {
     int exp  = (x >> 3) & 0xF;
     int mant = x & 0x7;
 
-    if (exp == 0) return sign * (mant / 8.f);
+    if (exp == 0) return sign * (mant * 0.125f);
     if (exp == 15) return 0.f;
 
     return sign * ldexpf(1.f + mant / 8.f, exp - 7);
@@ -305,6 +305,7 @@ __global__ void hyperion_fa3_fixed(
                     }
 
                     int k_tile = tile - CP_ASYNC_STAGES;
+                    int smem_stage = (stage + 1) % CP_ASYNC_STAGES;
 
                     for (int row = lane;
                          row < block_size;
@@ -314,6 +315,7 @@ __global__ void hyperion_fa3_fixed(
                         if (k_row >= ctx_len) continue;
                         if (causal && k_row > q_idx) continue;
 
+                        int row_in_block = row;
                         int bits = 0;
 
                         #pragma unroll 4
@@ -322,12 +324,11 @@ __global__ void hyperion_fa3_fixed(
                              p += WARP_SIZE) {
 
                             int sw =
-                                xor_swizzle_bank(row % block_size,
+                                xor_swizzle_bank(row_in_block,
                                                  p,
                                                  STRIDE_K);
 
-                            uint32_t k_word =
-                                k_smem[(stage + 1) % CP_ASYNC_STAGES][sw];
+                            uint32_t k_word = k_smem[smem_stage][sw];
 
                             uint32_t xnor = ~(q_row[p] ^ k_word);
                             bits += __popc(xnor);
@@ -349,14 +350,12 @@ __global__ void hyperion_fa3_fixed(
                             if (d < head_dim) {
 
                                 int sw =
-                                    xor_swizzle_bank(row % block_size,
+                                    xor_swizzle_bank(row_in_block,
                                                      d,
                                                      STRIDE_V);
 
                                 float v =
-                                    fp8_e4m3_to_fp32(
-                                        v_smem[(stage + 1) %
-                                               CP_ASYNC_STAGES][sw]);
+                                    fp8_e4m3_to_fp32(v_smem[smem_stage][sw]);
 
                                 acc_frag[i] =
                                     acc_frag[i] * alpha + w * v;
@@ -451,13 +450,11 @@ class ContinuousBatch:
     def __init__(self, max_batch_size: int = 32):
         self.max_batch_size = max_batch_size
         self.active_requests = {}
-        self.current_batch = []
 
     def can_add(self, req: PrioritizedRequest) -> bool:
-        return len(self.current_batch) < self.max_batch_size
+        return len(self.active_requests) < self.max_batch_size
 
     def add(self, req: PrioritizedRequest):
-        self.current_batch.append(req)
         self.active_requests[req.req_id] = (0, req.max_tokens)
 
     def update(self, req_id: str, tokens_generated: int):
@@ -466,7 +463,6 @@ class ContinuousBatch:
             generated += tokens_generated
             if generated >= max_tok:
                 del self.active_requests[req_id]
-                self.current_batch = [r for r in self.current_batch if r.req_id != req_id]
             else:
                 self.active_requests[req_id] = (generated, max_tok)
 
@@ -502,7 +498,8 @@ class KVAwareScheduler:
 
     def compute_cost(self, req: PrioritizedRequest) -> float:
         wait = time.time() - req.arrival_time
-        hot = np.mean([self.kv_hotness.get(b, 0) for b in req.block_table[:8]])
+        blocks = req.block_table[:8]
+        hot = sum(self.kv_hotness.get(b, 0) for b in blocks) / max(len(blocks), 1)
         prio_factor = 1.0 / (req.priority + 1)
         return wait - 0.5 * hot + prio_factor * 10
 
@@ -594,7 +591,7 @@ class PersistentKernelManager:
                 for b in req.block_table[:8]:
                     if b in prefetch_map:
                         hint |= (1 << prefetch_map[b])
-                sig = hash(str(req.kv_signature)) & 0x7fffffff
+                sig = hash(req.kv_signature) & 0x7fffffff
                 worklist.append([q_idx, 0, sig, hint])
         return torch.tensor(worklist, dtype=torch.int32, device='cuda')
 
@@ -692,12 +689,13 @@ class HyperionBatchingEngine:
                 time.sleep(0.1)
 
     def get_stats(self) -> Dict[str, Any]:
+        latencies = list(self.scheduler.latencies)
         return {
             'completed': self.scheduler.completed,
             'rejected': self.scheduler.rejected,
-            'avg_latency': np.mean(list(self.scheduler.latencies)) if self.scheduler.latencies else 0,
-            'p95_latency': np.percentile(list(self.scheduler.latencies), 95) if self.scheduler.latencies else 0,
-            'p99_latency': np.percentile(list(self.scheduler.latencies), 99) if self.scheduler.latencies else 0,
+            'avg_latency': np.mean(latencies) if latencies else 0,
+            'p95_latency': np.percentile(latencies, 95) if latencies else 0,
+            'p99_latency': np.percentile(latencies, 99) if latencies else 0,
             'active_requests': len(self.scheduler.continuous_batch.active_requests)
         }
 
