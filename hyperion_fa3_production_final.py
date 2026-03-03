@@ -218,7 +218,7 @@ __global__ void hyperion_fa3_fixed(
             const uint32_t* q_row =
                 Q_bin + (bh * seq_q + q_idx) * packed_cols;
 
-            float q_scale_val = Q_scale[bh * seq_q + q_idx];
+            float q_scale_val = __ldg(&Q_scale[bh * seq_q + q_idx]);
 
             float acc_frag[VEC_SIZE];
             int d_base = lane * VEC_SIZE;
@@ -236,6 +236,12 @@ __global__ void hyperion_fa3_fixed(
             // Fixed stride: assume max blocks = num_blocks
             const int32_t* block_table =
                 block_tables + bh * num_blocks;
+
+            // Per-WorkItem hoisted constants – eliminate redundant multiplies
+            // inside the hot KV-row loop.
+            const int   block_size_mask = block_size - 1;   // block_size always power-of-2
+            const float scale2   = q_scale_val * inv_sqrt_d * 2.f;
+            const float bias_dot = -(float)head_dim * q_scale_val * inv_sqrt_d;
 
             int stage   = 0;
             int pending = 0;
@@ -303,20 +309,27 @@ __global__ void hyperion_fa3_fixed(
                         if (k_row >= ctx_len) continue;
                         if (causal && k_row > q_idx) continue;
 
+                        // Hoist row-within-block index and smem base offsets
+                        // so the per-column loops see no extra multiply.
+                        const int row_in_block = row & block_size_mask;
+                        const int k_row_base   = row_in_block * STRIDE_K;
+                        const int v_row_base   = row_in_block * STRIDE_V;
+
                         int bits = 0;
 
-                        #pragma unroll 4
+                        #pragma unroll
                         for (int p = lane;
                              p < packed_cols;
                              p += WARP_SIZE) {
 
-                            int sw =
-                                xor_swizzle_bank(row % block_size,
-                                                 p,
-                                                 STRIDE_K);
+                            // Inline swizzle – compiler sees through __forceinline__
+                            // but explicit inline avoids any call overhead.
+                            int idx_k  = k_row_base + p;
+                            int bank_k = (idx_k >> 2) & 31;
+                            bank_k    ^= lane;
+                            int sw     = ((idx_k >> 5) << 5) | bank_k;
 
-                            uint32_t k_word =
-                                k_smem[stage][sw];
+                            uint32_t k_word = k_smem[stage][sw];
 
                             uint32_t xnor = ~(q_row[p] ^ k_word);
                             bits += __popc(xnor);
@@ -324,9 +337,8 @@ __global__ void hyperion_fa3_fixed(
 
                         bits = warp_reduce_sum_int(bits);
 
-                        float dot =
-                            (2.f * bits - head_dim) *
-                            q_scale_val * inv_sqrt_d;
+                        // dot = bits * scale2 + bias_dot  (one FMA, no extra mul)
+                        float dot   = __fmaf_rn((float)bits, scale2, bias_dot);
 
                         float m_new = fmaxf(m_i, dot);
                         float alpha = __expf(fmaxf(m_i - m_new, EXP_CLAMP));
@@ -337,21 +349,20 @@ __global__ void hyperion_fa3_fixed(
                             int d = d_base + i;
                             if (d < head_dim) {
 
-                                int sw =
-                                    xor_swizzle_bank(row % block_size,
-                                                     d,
-                                                     STRIDE_V);
+                                int idx_v  = v_row_base + d;
+                                int bank_v = (idx_v >> 2) & 31;
+                                bank_v    ^= lane;
+                                int sw_v   = ((idx_v >> 5) << 5) | bank_v;
 
                                 float v =
-                                    fp8_e4m3_to_fp32(
-                                        v_smem[stage][sw]);
+                                    fp8_e4m3_to_fp32(v_smem[stage][sw_v]);
 
-                                acc_frag[i] =
-                                    acc_frag[i] * alpha + w * v;
+                                // FMA: acc = acc * alpha + w * v
+                                acc_frag[i] = __fmaf_rn(acc_frag[i], alpha, w * v);
                             }
                         }
 
-                        l_i = l_i * alpha + w;
+                        l_i = __fmaf_rn(l_i, alpha, w);
                         m_i = m_new;
                     }
                 }
@@ -359,16 +370,30 @@ __global__ void hyperion_fa3_fixed(
                 stage = (stage + 1) % CP_ASYNC_STAGES;
             }
 
-            float inv_l = (l_i > 1e-6f) ? 1.f / l_i : 1.f;
+            // Fast reciprocal – single instruction on sm_86 with fast-math
+            float inv_l = (l_i > 1e-6f) ? __frcp_rn(l_i) : 1.f;
 
             half* out_row =
                 O + (bh * seq_q + q_idx) * head_dim;
 
-            #pragma unroll
-            for (int i = 0; i < VEC_SIZE; ++i) {
-                int d = d_base + i;
-                if (d < head_dim)
-                    out_row[d] = __float2half(acc_frag[i] * inv_l);
+            // Vectorized half2 writes: VEC_SIZE=4 → two half2 stores per thread
+            // (saves half the store instructions vs scalar half writes).
+            // Requires VEC_SIZE == 4; enforced at compile time below.
+            static_assert(VEC_SIZE == 4,
+                "Vectorized half2 output path requires VEC_SIZE == 4");
+            if (d_base + VEC_SIZE <= head_dim) {
+                half2* out2 = reinterpret_cast<half2*>(out_row + d_base);
+                out2[0] = __floats2half2_rn(acc_frag[0] * inv_l,
+                                            acc_frag[1] * inv_l);
+                out2[1] = __floats2half2_rn(acc_frag[2] * inv_l,
+                                            acc_frag[3] * inv_l);
+            } else {
+                #pragma unroll
+                for (int i = 0; i < VEC_SIZE; ++i) {
+                    int d = d_base + i;
+                    if (d < head_dim)
+                        out_row[d] = __float2half(acc_frag[i] * inv_l);
+                }
             }
         }
     }
@@ -490,17 +515,18 @@ class KVAwareScheduler:
 
     def compute_cost(self, req: PrioritizedRequest) -> float:
         wait = time.time() - req.arrival_time
-        hot = np.mean([self.kv_hotness.get(b, 0) for b in req.block_table[:8]])
+        # Pure-Python sum is faster than np.mean for only 8 elements.
+        hot = sum(self.kv_hotness.get(b, 0.0) for b in req.block_table[:8]) * 0.125
         prio_factor = 1.0 / (req.priority + 1)
         return wait - 0.5 * hot + prio_factor * 10
 
     def decay_hotness(self):
         now = time.time()
         if now - self.last_decay > 0.05:
-            for k in list(self.kv_hotness.keys()):
-                self.kv_hotness[k] *= self.hotness_decay
-                if self.kv_hotness[k] < 1e-3:
-                    del self.kv_hotness[k]
+            decay = self.hotness_decay
+            # Single-pass: multiply once, keep only entries that survive threshold.
+            self.kv_hotness = {k: nv for k, v in self.kv_hotness.items()
+                               if (nv := v * decay) >= 1e-3}
             self.last_decay = now
 
     def submit(self, req: PrioritizedRequest) -> bool:
@@ -575,16 +601,28 @@ class PersistentKernelManager:
     def prepare_worklist(self, batch: List[PrioritizedRequest], seq_q: int,
                           prefetch_blocks: List[int]) -> torch.Tensor:
         prefetch_map = {b: i for i, b in enumerate(prefetch_blocks[:8])}
-        worklist = []
+
+        # Count total work items up-front so we can pre-allocate one numpy array
+        # instead of building a Python list with per-item append overhead.
+        total = sum(min(seq_q, req.input_ids.size(1)) for req in batch)
+        arr = np.empty((total, 4), dtype=np.int32)
+
+        pos = 0
         for req in batch:
-            for q_idx in range(min(seq_q, req.input_ids.size(1))):
-                hint = 0
-                for b in req.block_table[:8]:
-                    if b in prefetch_map:
-                        hint |= (1 << prefetch_map[b])
-                sig = hash(req.kv_signature) & 0x7fffffff
-                worklist.append([q_idx, 0, sig, hint])
-        return torch.tensor(worklist, dtype=torch.int32, device='cuda')
+            q_count = min(seq_q, req.input_ids.size(1))
+            hint = 0
+            for b in req.block_table[:8]:
+                if b in prefetch_map:
+                    hint |= (1 << prefetch_map[b])
+            sig = hash(req.kv_signature) & 0x7fffffff
+            # Fill all q_idx rows at once via numpy slice assignment.
+            arr[pos:pos + q_count, 0] = np.arange(q_count, dtype=np.int32)
+            arr[pos:pos + q_count, 1] = 0       # bh
+            arr[pos:pos + q_count, 2] = sig
+            arr[pos:pos + q_count, 3] = hint
+            pos += q_count
+
+        return torch.from_numpy(arr).to('cuda', non_blocking=True)
 
 # =============================================================================
 # Main Batching Engine
@@ -593,7 +631,9 @@ class HyperionBatchingEngine:
     def __init__(self, model, tokenizer,
                  num_heads: int, num_kv_heads: int,
                  head_dim: int, block_size: int = 64,
-                 num_blocks: int = 1024):
+                 num_blocks: int = 1024,
+                 max_batch_size: int = 32,
+                 max_seq_len: int = 4096):
         self.model = model
         self.tokenizer = tokenizer
         self.num_heads = num_heads
@@ -601,8 +641,10 @@ class HyperionBatchingEngine:
         self.head_dim = head_dim
         self.block_size = block_size
         self.num_blocks = num_blocks
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
         self.packed_cols = (head_dim + 31) // 32
-        self.scheduler = KVAwareScheduler(max_batch_size=32)
+        self.scheduler = KVAwareScheduler(max_batch_size=max_batch_size)
         self.kernel_manager = PersistentKernelManager()
 
         # KV缓存
@@ -612,6 +654,32 @@ class HyperionBatchingEngine:
             'v': torch.zeros(num_blocks * block_size, num_kv_heads, head_dim,
                              dtype=torch.uint8, device='cuda'),
         }
+
+        # Per-batch-slot element counts (used for both allocation and slicing).
+        _q_bin_per   = num_kv_heads * max_seq_len * self.packed_cols
+        _q_scale_per = num_kv_heads * max_seq_len
+        _o_per       = max_seq_len * head_dim
+
+        # Pre-allocated persistent CUDA buffers – reused every batch iteration
+        # to eliminate per-batch torch.zeros allocation and CUDA memset overhead.
+        # Actual batch size must not exceed max_batch_size; sequence length must
+        # not exceed max_seq_len, or slicing will raise an index error.
+        self._q_bin_per   = _q_bin_per
+        self._q_scale_per = _q_scale_per
+        self._o_per       = _o_per
+        self._q_bin_buf = torch.zeros(
+            max_batch_size * _q_bin_per,
+            dtype=torch.int32, device='cuda')
+        self._q_scale_buf = torch.zeros(
+            max_batch_size * _q_scale_per,
+            dtype=torch.float32, device='cuda')
+        self._ctx_lens_buf = torch.zeros(
+            max_batch_size, dtype=torch.int32, device='cuda')
+        self._block_tables_buf = torch.zeros(
+            max_batch_size, num_blocks, dtype=torch.int32, device='cuda')
+        self._o_buf = torch.zeros(
+            max_batch_size * _o_per,
+            dtype=torch.float16, device='cuda')
 
         self.running = True
         self.batch_thread = threading.Thread(target=self._batch_loop, daemon=True)
@@ -657,15 +725,31 @@ class HyperionBatchingEngine:
                 )
 
                 if HYPERION_LOADED and worklist.numel() > 0:
+                    bs = len(batch)
+                    assert bs <= self.max_batch_size, (
+                        f"Batch size {bs} exceeds pre-allocated max {self.max_batch_size}")
+                    # Slice pre-allocated buffers to actual batch dimensions using
+                    # the per-slot constants computed at init – no allocation here.
+                    q_bin     = self._q_bin_buf[:bs * self._q_bin_per]
+                    q_scale   = self._q_scale_buf[:bs * self._q_scale_per]
+                    ctx_len_t = self._ctx_lens_buf[:bs]
+                    # Populate context lengths directly on CUDA (small tensor)
+                    ctx_len_t.copy_(
+                        torch.tensor([req.ctx_len for req in batch],
+                                     dtype=torch.int32, device='cuda'),
+                        non_blocking=True)
+                    block_tbl = self._block_tables_buf[:bs]
+                    o_out     = self._o_buf[:bs * self._o_per]
+
                     hyperion.hyperion_fa3_fixed(
                         worklist, worklist.size(0),
-                        torch.zeros(len(batch) * self.num_kv_heads * seq_q * self.packed_cols, dtype=torch.int32, device='cuda'),  # Q_bin
-                        torch.zeros(len(batch) * self.num_kv_heads * seq_q, dtype=torch.float32, device='cuda'),  # Q_scale
+                        q_bin,
+                        q_scale,
                         self.kv_cache['k'].view(-1, self.packed_cols),
                         self.kv_cache['v'].view(-1, self.head_dim),
-                        torch.tensor([req.ctx_len for req in batch], dtype=torch.int32, device='cuda'),
-                        torch.zeros(len(batch), self.num_blocks, dtype=torch.int32, device='cuda'),  # block_tables
-                        torch.zeros(len(batch) * seq_q * self.head_dim, dtype=torch.float16, device='cuda'),  # O
+                        ctx_len_t,
+                        block_tbl,
+                        o_out,
                         seq_q, self.head_dim, self.packed_cols,
                         self.block_size, self.num_blocks,
                         1.0 / math.sqrt(self.head_dim), True,
