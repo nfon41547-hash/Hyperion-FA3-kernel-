@@ -91,7 +91,7 @@ int xor_swizzle_bank(int row, int col, int stride) {
     int idx  = row * stride + col;
     int bank = (idx >> 2) & 31;
     int lane = threadIdx.x & 31;
-    bank ^= lane;
+    bank ^= (lane >> 3);
     return ((idx >> 5) << 5) | bank;
 }
 
@@ -239,49 +239,60 @@ __global__ void hyperion_fa3_fixed(
 
             int stage   = 0;
             int pending = 0;
+            int issued  = 0;
 
             for (int tile = 0; tile < num_tiles + CP_ASYNC_STAGES; ++tile) {
 
                 // ================= LOAD =================
                 if (tile < num_tiles && warp_id < 4) {
 
-                    int vec   = lane;
-                    int g_idx = tile * block_size + vec;
+                    // Each load warp covers a distinct slice of [0, block_size).
+                    // block_size must be <= WARPS_PER_BLOCK * WARP_SIZE (256).
+                    int linear_lane = warp_id * WARP_SIZE + lane;
 
-                    if (g_idx < ctx_len) {
+                    for (int vec = linear_lane;
+                         vec < block_size;
+                         vec += WARPS_PER_BLOCK * WARP_SIZE) {
 
-                        int block_idx = g_idx / block_size;
-                        int offset    = g_idx % block_size;
-                        int block_id  = block_table[block_idx];
+                        int g_idx = tile * block_size + vec;
 
-                        if (block_id >= 0 && block_id < num_blocks) {
+                        if (g_idx < ctx_len) {
 
-                            int64_t slot =
-                                (int64_t)block_id * block_size + offset;
+                            int block_idx = g_idx / block_size;
+                            int offset    = g_idx % block_size;
+                            int block_id  = block_table[block_idx];
 
-                            if (warp_id < 2) {
-                                const uint32_t* src =
+                            if (block_id >= 0 && block_id < num_blocks) {
+
+                                int64_t slot =
+                                    (int64_t)block_id * block_size + offset;
+
+                                const uint32_t* k_src =
                                     K_cache + slot * packed_cols;
 
-                                int sw =
+                                int sw_k =
                                     xor_swizzle_bank(offset, vec, STRIDE_K);
 
-                                cp_async_16B(k_smem[stage] + sw, src);
-                            } else {
-                                const uint8_t* src =
+                                cp_async_16B(k_smem[stage] + sw_k, k_src);
+
+                                const uint8_t* v_src =
                                     V_cache + slot * head_dim + vec;
 
-                                int sw =
+                                int sw_v =
                                     xor_swizzle_bank(offset, vec, STRIDE_V);
 
-                                cp_async_16B(v_smem[stage] + sw, src);
+                                cp_async_16B(v_smem[stage] + sw_v, v_src);
                             }
                         }
                     }
 
-                    if (lane == 0 && (tile & 1) == 0) {
-                        cp_async_commit_group();
-                        pending++;
+                    // Commit based on actual issued tile count (lane 0 only).
+                    if (lane == 0) {
+                        issued++;
+                        if ((issued % CP_GROUP_DEPTH) == 0) {
+                            cp_async_commit_group();
+                            pending++;
+                        }
                     }
                 }
 
