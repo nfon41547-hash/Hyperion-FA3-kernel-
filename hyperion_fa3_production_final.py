@@ -13,6 +13,7 @@
 #   • Full RTX 3090 optimization
 # =============================================================================
 
+import os
 import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load_inline
@@ -411,6 +412,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 # =============================================================================
 def align16(x: int) -> int:
     return (x + 15) & ~15
+
+# Allow the CUDA toolkit location to be overridden via environment variable.
+# Falls back to common install paths if neither CUDA_HOME nor CUDA_PATH is set.
+def _resolve_cuda_home() -> Optional[str]:
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home and os.path.isdir(cuda_home):
+        return cuda_home
+    candidates = [
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0",
+        "/usr/local/cuda",
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return None
+
+_cuda_home = _resolve_cuda_home()
+if _cuda_home:
+    os.environ.setdefault("CUDA_HOME", _cuda_home)
+    os.environ.setdefault("CUDA_PATH", _cuda_home)
 
 try:
     hyperion = load_inline(
