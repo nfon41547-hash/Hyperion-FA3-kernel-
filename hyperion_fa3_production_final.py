@@ -64,7 +64,8 @@ __device__ int g_work_counter = 0;
 
 __global__ void hyperion_reset_counter() {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        g_work_counter = 0;
+        atomicExch(&g_work_counter, 0);
+        __threadfence();
     }
 }
 
