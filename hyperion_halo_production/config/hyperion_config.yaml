@@ -1,0 +1,81 @@
+# =============================================================================
+# hyperion_config.yaml – Main Hyperion HALO Configuration
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Kernel settings (Apex V3)
+# ---------------------------------------------------------------------------
+kernel:
+  cp_async_stages: 6          # pipeline stages
+  skp_lookahead: 2            # speculative tile lookahead
+  work_chunk_size: 128        # CTA work-stealing chunk
+  smem_pad: 8                 # shared-memory padding (bytes)
+  threads_per_block: 256
+  vec_size: 4
+  max_head_dim: 256
+  align_boundary: 128
+  arch: sm_86                 # target compute capability
+
+# ---------------------------------------------------------------------------
+# Model / attention settings
+# ---------------------------------------------------------------------------
+model:
+  num_heads: 64
+  num_kv_heads: 8
+  head_dim: 128
+  block_size: 64              # KV-cache block size (tokens)
+  num_blocks: 2048            # total physical KV blocks in pool
+  dtype: float16
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+scheduler:
+  max_batch_size: 32
+  target_p95_ms: 100.0
+  target_p99_ms: 200.0
+  cluster_window_ms: 2.0
+  prefetch_top_n: 8
+  hotness_decay: 0.9
+  aging_boost_per_sec: 5.0
+  speculative_slots: 4        # reserved capacity for draft batches
+
+# ---------------------------------------------------------------------------
+# Speculative decoding
+# ---------------------------------------------------------------------------
+speculative:
+  enabled: true
+  draft_steps: 4
+  eos_token_id: 2
+  pad_token_id: 0
+  temperature: 1.0
+
+# ---------------------------------------------------------------------------
+# Serving
+# ---------------------------------------------------------------------------
+server:
+  host: "0.0.0.0"
+  port: 8000
+  max_concurrent_requests: 256
+  request_timeout_s: 60.0
+  log_level: INFO
+
+# ---------------------------------------------------------------------------
+# Monitoring
+# ---------------------------------------------------------------------------
+monitoring:
+  metrics_window: 1000        # recent requests to keep in memory
+  dashboard_refresh_s: 2.0
+  alert_rules:
+    - name: high_p99
+      metric: p99_latency_ms
+      threshold: 500
+      op: ">"
+      cooldown_s: 30
+      severity: WARNING
+    - name: kv_cache_near_full
+      metric: kv_cache_utilization
+      threshold: 0.90
+      op: ">="
+      cooldown_s: 10
+      severity: ERROR

@@ -1,0 +1,84 @@
+# =============================================================================
+# Hyperion HALO – Multi-Container Docker Compose
+# =============================================================================
+version: "3.9"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Main inference server
+  # ---------------------------------------------------------------------------
+  hyperion-server:
+    build:
+      context: ..
+      dockerfile: hyperion_halo_production/docker/Dockerfile
+    image: hyperion-halo:latest
+    container_name: hyperion-server
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HYPERION_LOG_LEVEL=INFO
+      - HYPERION_CONFIG=/workspace/config/hyperion_config.yaml
+    volumes:
+      - model-weights:/workspace/models
+      - ./logs:/workspace/logs
+    ports:
+      - "8000:8000"
+    networks:
+      - hyperion-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Prometheus metrics exporter (scrapes /metrics endpoint)
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hyperion-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - hyperion-net
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # ---------------------------------------------------------------------------
+  # Grafana dashboard
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hyperion-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=hyperion
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - hyperion-net
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+volumes:
+  model-weights:
+  grafana-data:
+
+networks:
+  hyperion-net:
+    driver: bridge

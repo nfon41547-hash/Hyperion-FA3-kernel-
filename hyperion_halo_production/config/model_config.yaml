@@ -1,0 +1,63 @@
+# =============================================================================
+# model_config.yaml – Model Configuration for Hyperion HALO
+# =============================================================================
+
+# Draft model (7B) used for speculative decoding
+draft_model:
+  name: "meta-llama/Llama-2-7b-hf"
+  num_layers: 32
+  num_heads: 32
+  num_kv_heads: 32
+  head_dim: 128
+  hidden_size: 4096
+  vocab_size: 32000
+  max_seq_len: 4096
+  dtype: float16
+  device: cuda
+
+# Target model – choose one:
+# ---------------------------------------------------------------------------
+target_model_70b:
+  name: "meta-llama/Meta-Llama-3-70B"
+  num_layers: 80
+  num_heads: 64
+  num_kv_heads: 8
+  head_dim: 128
+  hidden_size: 8192
+  vocab_size: 128256
+  max_seq_len: 8192
+  dtype: float16
+  device: cuda
+  tensor_parallel_size: 1
+
+target_model_405b:
+  name: "meta-llama/Meta-Llama-3.1-405B"
+  num_layers: 126
+  num_heads: 128
+  num_kv_heads: 8
+  head_dim: 128
+  hidden_size: 16384
+  vocab_size: 128256
+  max_seq_len: 131072
+  dtype: float16
+  device: cuda
+  tensor_parallel_size: 8
+
+# ---------------------------------------------------------------------------
+# Quantization presets
+# ---------------------------------------------------------------------------
+quantization:
+  k_bits: 4           # K-cache: INT4
+  v_bits: 8           # V-cache: FP8 E4M3
+  group_size: 128
+  symmetric: true
+
+# ---------------------------------------------------------------------------
+# Memory estimates (GB) on a single A100-80GB
+# These are informational only; runtime allocation may differ.
+# ---------------------------------------------------------------------------
+memory_estimates:
+  model_7b_fp16:   14.0
+  model_70b_fp16: 140.0
+  model_405b_fp16: 810.0
+  kv_cache_per_1k_tokens_70b: 0.016   # GB per 1000 tokens (INT4-K + FP8-V)
